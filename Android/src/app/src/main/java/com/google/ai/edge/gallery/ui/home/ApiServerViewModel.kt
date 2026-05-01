@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
 import androidx.lifecycle.ViewModel
+import com.google.ai.edge.gallery.server.InferenceServerService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,17 +23,15 @@ class ApiServerViewModel @Inject constructor(
     val connectionUrl = _connectionUrl.asStateFlow()
 
     fun startServer() {
-        // TODO: Start the actual InferenceServerService when implemented
-        // val intent = Intent(context, InferenceServerService::class.java)
-        // context.startForegroundService(intent)
+        val intent = Intent(context, InferenceServerService::class.java)
+        context.startForegroundService(intent)
         _isServerRunning.value = true
         _connectionUrl.value = "http://${getLocalIpAddress()}:8080/v1/chat/completions"
     }
 
     fun stopServer() {
-        // TODO: Stop the actual InferenceServerService when implemented
-        // val intent = Intent(context, InferenceServerService::class.java)
-        // context.stopService(intent)
+        val intent = Intent(context, InferenceServerService::class.java)
+        context.stopService(intent)
         _isServerRunning.value = false
         _connectionUrl.value = ""
     }

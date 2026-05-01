@@ -25,7 +25,6 @@ plugins {
   alias(libs.plugins.hilt.application)
   alias(libs.plugins.oss.licenses)
   alias(libs.plugins.ksp)
-  kotlin("kapt")
 }
 
 android {
@@ -110,7 +109,7 @@ dependencies {
   implementation(libs.firebase.messaging)
   implementation(libs.androidx.exifinterface)
   implementation(libs.moshi.kotlin)
-  kapt(libs.hilt.android.compiler)
+  ksp(libs.hilt.android.compiler)
   testImplementation(libs.junit)
   androidTestImplementation(libs.androidx.junit)
   androidTestImplementation(libs.androidx.espresso.core)
@@ -121,6 +120,11 @@ dependencies {
   debugImplementation(libs.androidx.ui.test.manifest)
   ksp(libs.moshi.kotlin.codegen)
   implementation(libs.mlkit.genai.prompt)
+  implementation(libs.ktor.server.cio)
+  implementation(libs.ktor.server.core)
+  implementation(libs.ktor.server.sse)
+  implementation(libs.ktor.server.content.negotiation)
+  implementation(libs.ktor.serialization.gson)
 }
 
 protobuf {

@@ -54,6 +54,7 @@ import com.google.ai.edge.gallery.data.createLlmChatConfigs
 import com.google.ai.edge.gallery.proto.AccessTokenData
 import com.google.ai.edge.gallery.proto.ImportedModel
 import com.google.ai.edge.gallery.proto.Theme
+import com.google.ai.edge.gallery.data.ModelRepository
 import com.google.ai.edge.gallery.runtime.aicore.AICoreModelHelper
 import com.google.gson.Gson
 import com.google.gson.JsonSyntaxException
@@ -194,6 +195,7 @@ constructor(
   private val lifecycleProvider: AppLifecycleProvider,
   private val customTasks: Set<@JvmSuppressWildcards CustomTask>,
   @ApplicationContext private val context: Context,
+  private val modelRepository: ModelRepository,
 ) : ViewModel() {
   private val externalFilesDir = context.getExternalFilesDir(null)
   protected val _uiState = MutableStateFlow(createEmptyUiState())
@@ -442,6 +444,7 @@ constructor(
         model.initializing = false
         if (model.instance != null) {
           Log.d(TAG, "Model '${model.name}' initialized successfully")
+          modelRepository.setActiveModel(model)
           updateModelInitializationStatus(
             model = model,
             status = ModelInitializationStatusType.INITIALIZED,
