@@ -12,12 +12,13 @@ data class ChatCompletionResponse(
 data class CompletionChoice(
   val index: Int = 0,
   val message: AssistantMessage,
-  val finish_reason: String = "stop",
+  val finish_reason: String,
 )
 
 data class AssistantMessage(
   val role: String = "assistant",
-  val content: String,
+  val content: String?,
+  val tool_calls: List<Map<String, Any>>? = null,
 )
 
 data class CompletionUsage(

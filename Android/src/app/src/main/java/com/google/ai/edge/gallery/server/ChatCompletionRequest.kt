@@ -6,4 +6,5 @@ data class ChatCompletionRequest(
   val stream: Boolean? = null,
   val temperature: Float? = null,
   val max_tokens: Int? = null,
+  val tools: List<Map<String, Any>>? = null,
 )

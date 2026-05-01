@@ -22,12 +22,13 @@ object PromptFormatter {
 
     val userPrompt = if (conversationMessages.size == 1 && conversationMessages[0].role == "user") {
       // Single user message — pass through directly.
-      conversationMessages[0].content
+      conversationMessages[0].content ?: ""
     } else {
       // Multi-turn: format with Gemma turn markers.
+      // Handles role:"tool" messages by rendering them with their role label.
       val sb = StringBuilder()
       for (msg in conversationMessages) {
-        sb.append("<start_of_turn>${msg.role}\n${msg.content}<end_of_turn>\n")
+        sb.append("<start_of_turn>${msg.role}\n${msg.content ?: ""}<end_of_turn>\n")
       }
       sb.append("<start_of_turn>model\n")
       sb.toString()
