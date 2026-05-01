@@ -25,6 +25,7 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytesWriter
+import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.utils.io.ByteWriteChannel
@@ -277,6 +278,28 @@ private fun Application.configureServer(modelRepository: ModelRepository, gson: 
           HttpStatusCode.InternalServerError,
           "Internal server error: ${e.message}",
           "server_error",
+          gson,
+        )
+      }
+    }
+
+    get("/v1/models") {
+      val models = modelRepository.getDownloadedModels().map { model ->
+        ModelObject(id = model.name, created = System.currentTimeMillis() / 1000L)
+      }
+      call.respond(ModelsListResponse(data = models))
+    }
+
+    get("/v1/models/{modelId}") {
+      val modelId = call.parameters["modelId"] ?: ""
+      val model = modelRepository.getDownloadedModels().find { it.name == modelId }
+      if (model != null) {
+        call.respond(ModelObject(id = model.name, created = System.currentTimeMillis() / 1000L))
+      } else {
+        call.respondError(
+          HttpStatusCode.NotFound,
+          "Model '$modelId' not found",
+          "invalid_request_error",
           gson,
         )
       }

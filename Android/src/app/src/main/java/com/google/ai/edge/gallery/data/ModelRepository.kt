@@ -15,15 +15,25 @@ class ModelRepository @Inject constructor() {
 
   @Volatile private var activeModel: Model? = null
 
+  @Volatile private var downloadedModels: List<Model> = emptyList()
+
   private val inferenceLock = AtomicBoolean(false)
 
-  /** Called by the UI ViewModel after a model finishes loading. */
-  fun setActiveModel(model: Model) {
+  /** Called by the UI ViewModel after a model finishes loading (or to clear). */
+  fun setActiveModel(model: Model?) {
     activeModel = model
   }
 
   /** Returns the currently active model, or null if none is loaded. */
   fun getActiveModel(): Model? = activeModel
+
+  /** Called by the UI ViewModel whenever download status changes. */
+  fun setDownloadedModels(models: List<Model>) {
+    downloadedModels = models
+  }
+
+  /** Returns the list of downloaded LLM models for use by the API server. */
+  fun getDownloadedModels(): List<Model> = downloadedModels
 
   /**
    * Attempts to acquire the inference lock. Returns true if acquired (caller may proceed),

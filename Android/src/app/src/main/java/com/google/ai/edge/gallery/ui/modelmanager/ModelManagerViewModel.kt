@@ -260,6 +260,10 @@ constructor(
     }
   }
 
+  private fun syncDownloadedModels() {
+    modelRepository.setDownloadedModels(getAllDownloadedModels())
+  }
+
   fun processTasks() {
     val curTasks = getActiveCustomTasks().map { it.task }
     for (task in curTasks) {
@@ -402,6 +406,12 @@ constructor(
         modelImportingUpdateTrigger = System.currentTimeMillis(),
       )
     _uiState.update { newUiState }
+
+    // Clear active model in the repository if it was deleted.
+    if (modelRepository.getActiveModel()?.name == model.name) {
+      modelRepository.setActiveModel(null)
+    }
+    syncDownloadedModels()
   }
 
   fun initializeModel(
@@ -536,6 +546,13 @@ constructor(
     }
 
     _uiState.update { newUiState }
+
+    if (
+      status.status == ModelDownloadStatusType.SUCCEEDED ||
+        status.status == ModelDownloadStatusType.NOT_DOWNLOADED
+    ) {
+      syncDownloadedModels()
+    }
   }
 
   fun setInitializationStatus(model: Model, status: ModelInitializationStatus) {
@@ -1027,6 +1044,9 @@ constructor(
 
         // Wait for AICore models statuses and update download indicators
         checkAICoreModelStatuses()
+
+        // Sync downloaded models to ModelRepository so the API server can read them.
+        syncDownloadedModels()
       } catch (e: Exception) {
         e.printStackTrace()
       }

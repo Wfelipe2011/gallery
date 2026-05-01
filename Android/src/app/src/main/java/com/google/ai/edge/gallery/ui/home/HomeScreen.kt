@@ -133,12 +133,21 @@ import com.google.ai.edge.gallery.ui.theme.homePageTitleStyle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.material3.Switch
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatus
+import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatusType
 
 private const val TAG = "AGHomeScreen"
 private const val TASK_COUNT_ANIMATION_DURATION = 250
@@ -180,6 +189,11 @@ fun HomeScreen(
   val scope = rememberCoroutineScope()
   val context = LocalContext.current
   val isDevBuild = context.packageName.endsWith(".dev")
+
+  val downloadedLlmModels = remember(uiState.modelDownloadStatus) {
+    modelManagerViewModel.getAllDownloadedModels()
+  }
+  val selectedApiModel by apiServerViewModel.selectedApiModel.collectAsState()
 
   var tasks = uiState.tasks
 
@@ -452,7 +466,17 @@ fun HomeScreen(
                   ApiServerControlCard(
                     apiServerViewModel = apiServerViewModel,
                     enableAnimation = enableAnimation,
-                    gm4 = gm4
+                    gm4 = gm4,
+                    downloadedModels = downloadedLlmModels,
+                    modelInitializationStatus = uiState.modelInitializationStatus,
+                    selectedApiModel = selectedApiModel,
+                    onModelSelected = { model ->
+                      val task = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_CHAT)
+                      if (task != null) {
+                        modelManagerViewModel.initializeModel(context, task, model)
+                      }
+                      apiServerViewModel.selectModel(model)
+                    }
                   )
                 }
 
@@ -1180,11 +1204,16 @@ private fun getCategoryLabel(context: Context, category: CategoryInfo): String {
   return context.getString(R.string.category_unlabeled)
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ApiServerControlCard(
   apiServerViewModel: ApiServerViewModel,
   enableAnimation: Boolean,
-  gm4: Boolean
+  gm4: Boolean,
+  downloadedModels: List<Model>,
+  modelInitializationStatus: Map<String, ModelInitializationStatus>,
+  selectedApiModel: Model?,
+  onModelSelected: (Model) -> Unit,
 ) {
   val isServerRunning by apiServerViewModel.isServerRunning.collectAsState()
   val connectionUrl by apiServerViewModel.connectionUrl.collectAsState()
@@ -1195,6 +1224,21 @@ fun ApiServerControlCard(
     animationDurationMs = CONTENT_COMPOSABLES_ANIMATION_DURATION,
     animationLabel = "api server card"
   )
+
+  var dropdownExpanded by remember { mutableStateOf(false) }
+
+  // Auto-select default model when server starts and no model is selected
+  LaunchedEffect(isServerRunning, downloadedModels) {
+    if (isServerRunning && downloadedModels.isNotEmpty() && selectedApiModel == null) {
+      val defaultModel = downloadedModels.firstOrNull {
+        it.name.contains("Gemma-4-E2B", ignoreCase = true) ||
+          it.displayName.contains("Gemma-4-E2B", ignoreCase = true)
+      } ?: downloadedModels.first()
+      onModelSelected(defaultModel)
+    }
+  }
+
+  val initStatus = modelInitializationStatus[selectedApiModel?.name]?.status
 
   Card(
     modifier = Modifier
@@ -1234,7 +1278,87 @@ fun ApiServerControlCard(
         )
       }
 
-      if (isServerRunning && connectionUrl.isNotEmpty()) {
+      AnimatedVisibility(visible = isServerRunning) {
+        Column {
+          Spacer(modifier = Modifier.height(12.dp))
+          if (downloadedModels.isEmpty()) {
+            Text(
+              text = "No LLM models downloaded. Download a model first.",
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          } else {
+            // Model selector dropdown
+            ExposedDropdownMenuBox(
+              expanded = dropdownExpanded,
+              onExpandedChange = { dropdownExpanded = it },
+              modifier = Modifier.fillMaxWidth()
+            ) {
+              val displayName = selectedApiModel
+                ?.let { it.displayName.ifEmpty { it.name } }
+                ?: downloadedModels.first().let { it.displayName.ifEmpty { it.name } }
+              OutlinedTextField(
+                value = displayName,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("Model") },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = dropdownExpanded) },
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+              )
+              ExposedDropdownMenu(
+                expanded = dropdownExpanded,
+                onDismissRequest = { dropdownExpanded = false }
+              ) {
+                downloadedModels.forEach { model ->
+                  DropdownMenuItem(
+                    text = { Text(model.displayName.ifEmpty { model.name }) },
+                    onClick = {
+                      onModelSelected(model)
+                      dropdownExpanded = false
+                    },
+                    contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
+                  )
+                }
+              }
+            }
+
+            // Model initialization status indicator
+            Spacer(modifier = Modifier.height(8.dp))
+            when (initStatus) {
+              ModelInitializationStatusType.INITIALIZING -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                  CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                  Spacer(modifier = Modifier.width(8.dp))
+                  Text("Loading model…", style = MaterialTheme.typography.bodySmall)
+                }
+              }
+              ModelInitializationStatusType.INITIALIZED -> {
+                Text(
+                  "● Ready",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = Color(0xFF4CAF50)
+                )
+              }
+              ModelInitializationStatusType.ERROR -> {
+                Text(
+                  "● Error loading model",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.error
+                )
+              }
+              else -> {}
+            }
+          }
+        }
+      }
+
+      // URL row — only shown once model is ready
+      if (isServerRunning &&
+        initStatus == ModelInitializationStatusType.INITIALIZED &&
+        connectionUrl.isNotEmpty()
+      ) {
         Spacer(modifier = Modifier.height(12.dp))
         Row(
           modifier = Modifier
@@ -1266,3 +1390,4 @@ fun ApiServerControlCard(
     }
   }
 }
+
