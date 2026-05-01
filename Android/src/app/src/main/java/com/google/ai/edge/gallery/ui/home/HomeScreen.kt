@@ -132,6 +132,13 @@ import com.google.ai.edge.gallery.ui.theme.customColors
 import com.google.ai.edge.gallery.ui.theme.homePageTitleStyle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.compose.material3.Switch
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 
 private const val TAG = "AGHomeScreen"
 private const val TASK_COUNT_ANIMATION_DURATION = 250
@@ -165,6 +172,7 @@ fun HomeScreen(
   enableAnimation: Boolean,
   modifier: Modifier = Modifier,
   gm4: Boolean = false,
+  apiServerViewModel: ApiServerViewModel = hiltViewModel(),
 ) {
   val uiState by modelManagerViewModel.uiState.collectAsState()
   var showSettingsDialog by remember { mutableStateOf(false) }
@@ -441,6 +449,11 @@ fun HomeScreen(
                   if (gm4) {
                     TryGm4IntroText(enableAnimation = enableAnimation)
                   }
+                  ApiServerControlCard(
+                    apiServerViewModel = apiServerViewModel,
+                    enableAnimation = enableAnimation,
+                    gm4 = gm4
+                  )
                 }
 
                 // Tab header for categories.
@@ -1165,4 +1178,91 @@ private fun getCategoryLabel(context: Context, category: CategoryInfo): String {
     return label
   }
   return context.getString(R.string.category_unlabeled)
+}
+
+@Composable
+fun ApiServerControlCard(
+  apiServerViewModel: ApiServerViewModel,
+  enableAnimation: Boolean,
+  gm4: Boolean
+) {
+  val isServerRunning by apiServerViewModel.isServerRunning.collectAsState()
+  val connectionUrl by apiServerViewModel.connectionUrl.collectAsState()
+  val clipboardManager: ClipboardManager = LocalClipboardManager.current
+
+  val progress = if (!enableAnimation) 1f else rememberDelayedAnimationProgress(
+    initialDelay = TITLE_SECOND_LINE_ANIMATION_START,
+    animationDurationMs = CONTENT_COMPOSABLES_ANIMATION_DURATION,
+    animationLabel = "api server card"
+  )
+
+  Card(
+    modifier = Modifier
+      .fillMaxWidth()
+      .graphicsLayer {
+        alpha = progress
+        translationY = (CONTENT_COMPOSABLES_OFFSET_Y.dp * (1 - progress)).toPx()
+      },
+    shape = RoundedCornerShape(16.dp),
+    colors = CardDefaults.cardColors(
+      containerColor = if (gm4) MaterialTheme.colorScheme.surfaceContainer else MaterialTheme.colorScheme.surfaceVariant
+    )
+  ) {
+    Column(modifier = Modifier.padding(16.dp)) {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Column {
+          Text(
+            text = "Local API Server",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold
+          )
+          Text(
+            text = if (isServerRunning) "Status: Running" else "Status: Stopped",
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (isServerRunning) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant
+          )
+        }
+        Switch(
+          checked = isServerRunning,
+          onCheckedChange = { isChecked ->
+            if (isChecked) apiServerViewModel.startServer() else apiServerViewModel.stopServer()
+          }
+        )
+      }
+
+      if (isServerRunning && connectionUrl.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Text(
+            text = connectionUrl,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f)
+          )
+          IconButton(
+            onClick = { clipboardManager.setText(AnnotatedString(connectionUrl)) },
+            modifier = Modifier.size(24.dp)
+          ) {
+            Icon(
+              imageVector = Icons.Rounded.ContentCopy,
+              contentDescription = "Copy Link",
+              tint = MaterialTheme.colorScheme.primary,
+              modifier = Modifier.size(16.dp)
+            )
+          }
+        }
+      }
+    }
+  }
 }
