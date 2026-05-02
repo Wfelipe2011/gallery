@@ -297,6 +297,13 @@ private fun Application.configureServer(
           // ===== Tool-calling path =====
           val instance = model.instance as? LlmModelInstance
           if (instance == null) {
+            // Model was unloaded — clean up any stale session keyed by the incoming ID.
+            incomingSessionId?.let { sid ->
+              sessionManager.getStaleSession(sid)?.let { stale ->
+                stale.closeConversation()
+                sessionManager.removeSession(sid)
+              }
+            }
             modelRepository.releaseInference()
             call.respondError(
               HttpStatusCode.ServiceUnavailable,
@@ -312,15 +319,29 @@ private fun Application.configureServer(
             tool(DynamicOpenApiTool(toolMap))
           }
 
-          val session = sessionManager.getOrCreate(
-            sessionId = incomingSessionId,
-            engine = instance.engine,
-            toolProviders = toolProviders,
-          )
-
-          // Determine turn type: tool-result turn vs normal user turn.
+          // Determine turn type BEFORE session lookup so we can recover the correct
+          // session via tool_call_id when clients don't echo X-Session-Id.
           val nonSystemMessages = request.messages.filter { it.role != "system" }
           val isToolResultTurn = nonSystemMessages.lastOrNull()?.role == "tool"
+
+          // For tool-result turns, extract the assistant's tool_call IDs so
+          // SessionManager can find the session from the previous turn.
+          val incomingCallIds: List<String> = if (isToolResultTurn) {
+            nonSystemMessages
+              .lastOrNull { msg -> msg.role == "assistant" && !msg.tool_calls.isNullOrEmpty() }
+              ?.tool_calls
+              ?.mapNotNull { tc -> tc["id"] as? String }
+              ?: emptyList()
+          } else {
+            emptyList()
+          }
+
+          val session = sessionManager.getOrCreate(
+            sessionId = incomingSessionId,
+            toolCallIds = incomingCallIds,
+            model = model,
+            toolProviders = toolProviders,
+          )
 
           val contentsToSend: Contents
           if (isToolResultTurn) {
@@ -351,29 +372,31 @@ private fun Application.configureServer(
           val tokenChannel = Channel<String?>(capacity = Channel.UNLIMITED)
           var lastMessage: Message? = null
 
-          session.conversation.sendMessageAsync(
-            contentsToSend,
-            object : MessageCallback {
-              override fun onMessage(message: Message) {
-                lastMessage = message
-                val text = message.toString()
-                if (text.isNotEmpty() && !text.startsWith("<ctrl")) {
-                  tokenChannel.trySend(text)
-                }
+          val inferenceCallback = object : MessageCallback {
+            override fun onMessage(message: Message) {
+              lastMessage = message
+              val text = message.toString()
+              if (text.isNotEmpty() && !text.startsWith("<ctrl")) {
+                tokenChannel.trySend(text)
               }
+            }
 
-              override fun onDone() {
-                tokenChannel.trySend(null)
-              }
+            override fun onDone() {
+              tokenChannel.trySend(null)
+            }
 
-              override fun onError(throwable: Throwable) {
-                Log.e(TAG, "Tool session inference error (session=${session.id})", throwable)
-                tokenChannel.trySend(null)
-              }
-            },
-            emptyMap(),
-          )
+            override fun onError(throwable: Throwable) {
+              Log.e(TAG, "Tool session inference error (session=${session.id})", throwable)
+              tokenChannel.trySend(null)
+            }
+          }
+          if (isToolResultTurn) {
+            session.conversation.sendMessageAsync(Message.tool(contentsToSend), inferenceCallback, emptyMap())
+          } else {
+            session.conversation.sendMessageAsync(contentsToSend, inferenceCallback, emptyMap())
+          }
 
+          var inferenceReleased = false
           try {
             val sb = StringBuilder()
             for (token in tokenChannel) {
@@ -386,10 +409,17 @@ private fun Application.configureServer(
             val assistantMessage: AssistantMessage
             val finishReason: String
 
+            // Generate call IDs once so both the JSON response and SSE chunks use
+            // the same IDs, and the SessionManager can recover the session on
+            // the tool-result turn even when X-Session-Id is not echoed back.
+            val generatedCallIds: List<String> = toolCallsList?.map {
+              "call_${UUID.randomUUID().toString().replace("-", "").take(24)}"
+            } ?: emptyList()
+
             if (toolCallsList != null) {
-              val toolCallsJson = toolCallsList.map { tc ->
+              val toolCallsJson = toolCallsList.mapIndexed { idx, tc ->
                 mapOf(
-                  "id" to "call_${UUID.randomUUID().toString().replace("-", "").take(24)}",
+                  "id" to generatedCallIds[idx],
                   "type" to "function",
                   "function" to mapOf(
                     "name" to tc.name,
@@ -399,24 +429,209 @@ private fun Application.configureServer(
               }
               assistantMessage = AssistantMessage(content = null, tool_calls = toolCallsJson)
               finishReason = "tool_calls"
+              // Register call IDs so the session can be recovered in the next turn.
+              sessionManager.registerCallIds(generatedCallIds, session)
             } else {
               assistantMessage = AssistantMessage(content = sb.toString())
               finishReason = "stop"
             }
 
-            val response = ChatCompletionResponse(
-              id = requestId,
-              created = created,
-              model = request.model,
-              choices = listOf(
-                CompletionChoice(message = assistantMessage, finish_reason = finishReason)
-              ),
-              usage = CompletionUsage(),
-            )
             call.response.headers.append("X-Session-Id", session.id)
-            call.respond(response)
+
+            if (request.stream == true) {
+              // ===== Streaming (SSE) response =====
+              val includeUsage =
+                (request.stream_options?.get("include_usage") as? Boolean) == true
+              call.respondBytesWriter(
+                contentType = ContentType.parse("text/event-stream"),
+              ) {
+                try {
+                  if (toolCallsList != null) {
+                    // 1. Role chunk
+                    writeChunk(
+                      this,
+                      gson,
+                      ChatCompletionChunk(
+                        id = requestId,
+                        created = created,
+                        model = request.model,
+                        choices =
+                          listOf(
+                            ChunkChoice(
+                              delta = Delta(role = "assistant"),
+                              finish_reason = null,
+                            )
+                          ),
+                      ),
+                    )
+                    // 2. Per-tool: name chunk then arguments chunk (reuse pre-generated IDs)
+                    toolCallsList.forEachIndexed { idx, tc ->
+                      val callId = generatedCallIds[idx]
+                      val argsJson = gson.toJson(tc.arguments)
+                      writeChunk(
+                        this,
+                        gson,
+                        ChatCompletionChunk(
+                          id = requestId,
+                          created = created,
+                          model = request.model,
+                          choices =
+                            listOf(
+                              ChunkChoice(
+                                delta =
+                                  Delta(
+                                    tool_calls =
+                                      listOf(
+                                        ToolCallChunk(
+                                          index = idx,
+                                          id = callId,
+                                          type = "function",
+                                          function =
+                                            ToolCallFunction(
+                                              name = tc.name,
+                                              arguments = "",
+                                            ),
+                                        )
+                                      )
+                                  ),
+                                finish_reason = null,
+                              )
+                            ),
+                        ),
+                      )
+                      writeChunk(
+                        this,
+                        gson,
+                        ChatCompletionChunk(
+                          id = requestId,
+                          created = created,
+                          model = request.model,
+                          choices =
+                            listOf(
+                              ChunkChoice(
+                                delta =
+                                  Delta(
+                                    tool_calls =
+                                      listOf(
+                                        ToolCallChunk(
+                                          index = idx,
+                                          function = ToolCallFunction(arguments = argsJson),
+                                        )
+                                      )
+                                  ),
+                                finish_reason = null,
+                              )
+                            ),
+                        ),
+                      )
+                    }
+                    // 3. Finish chunk
+                    writeChunk(
+                      this,
+                      gson,
+                      ChatCompletionChunk(
+                        id = requestId,
+                        created = created,
+                        model = request.model,
+                        choices =
+                          listOf(ChunkChoice(delta = Delta(), finish_reason = "tool_calls")),
+                      ),
+                    )
+                  } else {
+                    // stop path
+                    // 1. Role chunk
+                    writeChunk(
+                      this,
+                      gson,
+                      ChatCompletionChunk(
+                        id = requestId,
+                        created = created,
+                        model = request.model,
+                        choices =
+                          listOf(
+                            ChunkChoice(
+                              delta = Delta(role = "assistant", content = ""),
+                              finish_reason = null,
+                            )
+                          ),
+                      ),
+                    )
+                    // 2. Content chunk
+                    val content = sb.toString()
+                    if (content.isNotEmpty()) {
+                      writeChunk(
+                        this,
+                        gson,
+                        ChatCompletionChunk(
+                          id = requestId,
+                          created = created,
+                          model = request.model,
+                          choices =
+                            listOf(
+                              ChunkChoice(
+                                delta = Delta(content = content),
+                                finish_reason = null,
+                              )
+                            ),
+                        ),
+                      )
+                    }
+                    // 3. Stop chunk
+                    writeChunk(
+                      this,
+                      gson,
+                      ChatCompletionChunk(
+                        id = requestId,
+                        created = created,
+                        model = request.model,
+                        choices = listOf(ChunkChoice(delta = Delta(), finish_reason = "stop")),
+                      ),
+                    )
+                  }
+                  // Usage chunk (if requested)
+                  if (includeUsage) {
+                    writeChunk(
+                      this,
+                      gson,
+                      ChatCompletionChunk(
+                        id = requestId,
+                        created = created,
+                        model = request.model,
+                        choices = emptyList(),
+                        usage = CompletionUsage(),
+                      ),
+                    )
+                  }
+                  writeStringUtf8("data: [DONE]\n\n")
+                  flush()
+                } finally {
+                  modelRepository.releaseInference()
+                  inferenceReleased = true
+                }
+              }
+              // Session cleanup after streaming body completes.
+              if (finishReason == "stop") {
+                sessionManager.closeSession(session)
+              }
+            } else {
+              // ===== Non-streaming (plain JSON) — unchanged behaviour =====
+              val response =
+                ChatCompletionResponse(
+                  id = requestId,
+                  created = created,
+                  model = request.model,
+                  choices =
+                    listOf(CompletionChoice(message = assistantMessage, finish_reason = finishReason)),
+                  usage = CompletionUsage(),
+                )
+              call.respond(response)
+              // Session ends on final stop turn — restore the UI Conversation.
+              if (finishReason == "stop") {
+                sessionManager.closeSession(session)
+              }
+            }
           } finally {
-            modelRepository.releaseInference()
+            if (!inferenceReleased) modelRepository.releaseInference()
           }
         }
       } catch (e: Exception) {
@@ -461,46 +676,129 @@ private fun Application.configureServer(
 
 private class SessionManager {
   private val sessions = ConcurrentHashMap<String, ServerSession>()
+  // Maps tool_call_id → session_id for recovering sessions on tool-result turns
+  // when the client (e.g. Hermes Agent) does not echo X-Session-Id.
+  private val callIdToSessionId = ConcurrentHashMap<String, String>()
 
   fun getOrCreate(
     sessionId: String?,
-    engine: com.google.ai.edge.litertlm.Engine,
+    toolCallIds: List<String> = emptyList(),
+    model: com.google.ai.edge.gallery.data.Model,
     toolProviders: List<ToolProvider>,
   ): ServerSession {
-    evictExpired()
+    evictExpired(model)
+
+    // 1. Try matching by explicit X-Session-Id header.
     val existing = sessionId?.let { sessions[it] }
     if (existing != null) {
       existing.touch()
       return existing
     }
-    val newId = UUID.randomUUID().toString()
-    val conversation = engine.createConversation(
+
+    // 2. Try matching by tool_call_id so tool-result turns reuse the correct
+    //    conversation context from the preceding user/tool-calls turn.
+    for (callId in toolCallIds) {
+      val sid = callIdToSessionId[callId]
+      if (sid != null) {
+        val byCallId = sessions[sid]
+        if (byCallId != null) {
+          byCallId.touch()
+          Log.d(TAG, "Recovered session $sid via tool_call_id $callId")
+          return byCallId
+        }
+      }
+    }
+
+    // 3. No matching session — create a fresh one.
+    val instance = model.instance as LlmModelInstance
+    // Close the existing UI Conversation to satisfy LiteRT's one-session constraint.
+    instance.conversation.close()
+    val serverConv = instance.engine.createConversation(
       ConversationConfig(
         tools = toolProviders,
         automaticToolCalling = false,
       )
     )
-    val session = ServerSession(id = newId, conversation = conversation)
+    // Keep instance.conversation pointing at the active conversation.
+    instance.conversation = serverConv
+    val newId = UUID.randomUUID().toString()
+    val session = ServerSession(id = newId, conversation = serverConv, model = model)
     sessions[newId] = session
     Log.d(TAG, "Created new server session: $newId (${sessions.size} total)")
     return session
   }
 
-  private fun evictExpired() {
+  /** Associates tool call IDs with this session for later recovery. */
+  fun registerCallIds(callIds: List<String>, session: ServerSession) {
+    callIds.forEach { callId -> callIdToSessionId[callId] = session.id }
+    Log.d(TAG, "Registered ${callIds.size} call_id(s) for session ${session.id}")
+  }
+
+  /** Closes the server [Conversation] and restores the plain UI conversation. */
+  fun closeSession(session: ServerSession) {
+    sessions.remove(session.id)
+    // Remove any call_id → session_id mappings for this session.
+    callIdToSessionId.entries.removeIf { it.value == session.id }
+    try {
+      LlmChatModelHelper.resetConversation(
+        model = session.model,
+        supportImage = false,
+        supportAudio = false,
+        systemInstruction = null,
+        tools = emptyList(),
+      )
+      Log.d(TAG, "Restored UI conversation after session ${session.id}")
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to restore UI conversation after session ${session.id}", e)
+    }
+  }
+
+  private fun evictExpired(model: com.google.ai.edge.gallery.data.Model) {
     val iter = sessions.entries.iterator()
     while (iter.hasNext()) {
       val entry = iter.next()
       if (entry.value.isExpired()) {
-        entry.value.close()
-        iter.remove()
         Log.d(TAG, "Evicted expired session: ${entry.key}")
+        iter.remove()
+        try {
+          LlmChatModelHelper.resetConversation(
+            model = model,
+            supportImage = false,
+            supportAudio = false,
+            systemInstruction = null,
+            tools = emptyList(),
+          )
+        } catch (e: Exception) {
+          Log.e(TAG, "Failed to restore UI conversation on eviction", e)
+        }
       }
     }
   }
 
+  /** Returns a session by ID without touching it (for stale-session cleanup). */
+  fun getStaleSession(sessionId: String): ServerSession? = sessions[sessionId]
+
+  /** Removes a session by ID without restoring the UI conversation (used for stale cleanup). */
+  fun removeSession(sessionId: String) {
+    sessions.remove(sessionId)
+  }
+
   fun closeAll() {
-    sessions.values.forEach { it.close() }
+    sessions.values.forEach { session ->
+      try {
+        LlmChatModelHelper.resetConversation(
+          model = session.model,
+          supportImage = false,
+          supportAudio = false,
+          systemInstruction = null,
+          tools = emptyList(),
+        )
+      } catch (e: Exception) {
+        Log.e(TAG, "Failed to restore UI conversation in closeAll", e)
+      }
+    }
     sessions.clear()
+    callIdToSessionId.clear()
     Log.d(TAG, "All server sessions closed")
   }
 }
