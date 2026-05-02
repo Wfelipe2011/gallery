@@ -39,6 +39,8 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.writeStringUtf8
+import com.google.ai.edge.gallery.BuildConfig
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -124,10 +126,18 @@ private fun Application.configureServer(
 
   routing {
     post("/v1/chat/completions") {
+      val requestStartMs = System.currentTimeMillis()
+      var logStatusCode = 500
+      var logError: String? = null
+      var logRequestSummary = RequestSummary(0, false, false)
+      var logResponseSummary: ResponseSummary? = null
+      try {
       val request =
         try {
           call.receive<ChatCompletionRequest>()
         } catch (e: Exception) {
+          logStatusCode = 400
+          logError = "Invalid request body: ${e.message}"
           call.respondError(
             HttpStatusCode.BadRequest,
             "Invalid request body: ${e.message}",
@@ -137,7 +147,15 @@ private fun Application.configureServer(
           return@post
         }
 
+      logRequestSummary = RequestSummary(
+        messageCount = request.messages.size,
+        hasTools = !request.tools.isNullOrEmpty(),
+        hasSystemMessage = request.messages.any { it.role == "system" },
+      )
+
       if (request.messages.isEmpty()) {
+        logStatusCode = 400
+        logError = "Field 'messages' is required and must not be empty."
         call.respondError(
           HttpStatusCode.BadRequest,
           "Field 'messages' is required and must not be empty.",
@@ -149,6 +167,8 @@ private fun Application.configureServer(
 
       val model = modelRepository.getActiveModel()
       if (model == null) {
+        logStatusCode = 503
+        logError = "No model is currently loaded."
         call.respondError(
           HttpStatusCode.ServiceUnavailable,
           "No model is currently loaded.",
@@ -160,6 +180,8 @@ private fun Application.configureServer(
       }
 
       if (!modelRepository.tryAcquireInference()) {
+        logStatusCode = 503
+        logError = "Server is busy. Another inference is in progress."
         call.respondError(
           HttpStatusCode.ServiceUnavailable,
           "Server is busy. Another inference is in progress.",
@@ -186,7 +208,7 @@ private fun Application.configureServer(
             model = model,
             supportImage = false,
             supportAudio = false,
-            systemInstruction = null,
+            systemInstruction = formatted.systemInstruction?.let { Contents.of(it) },
           )
 
           // Channel bridges LiteRT's callback thread → Ktor coroutine.
@@ -213,6 +235,7 @@ private fun Application.configureServer(
           )
 
           if (isStreaming) {
+            logStatusCode = 200
             call.respondBytesWriter(
               contentType = ContentType.parse("text/event-stream"),
             ) {
@@ -274,6 +297,12 @@ private fun Application.configureServer(
                 if (token == null) break
                 sb.append(token)
               }
+              logStatusCode = 200
+              logResponseSummary = ResponseSummary(
+                content = sb.toString().take(500),
+                finishReason = "stop",
+                toolCallCount = 0,
+              )
               val response =
                 ChatCompletionResponse(
                   id = requestId,
@@ -304,6 +333,8 @@ private fun Application.configureServer(
                 sessionManager.removeSession(sid)
               }
             }
+            logStatusCode = 503
+            logError = "Model instance not initialized."
             modelRepository.releaseInference()
             call.respondError(
               HttpStatusCode.ServiceUnavailable,
@@ -318,6 +349,10 @@ private fun Application.configureServer(
           val toolProviders: List<ToolProvider> = tools.map { toolMap ->
             tool(DynamicOpenApiTool(toolMap))
           }
+
+          // Extract system instruction before filtering — it will be applied when a new
+          // session is created. Existing sessions already have the instruction applied.
+          val systemInstruction = request.messages.firstOrNull { it.role == "system" }?.content
 
           // Determine turn type BEFORE session lookup so we can recover the correct
           // session via tool_call_id when clients don't echo X-Session-Id.
@@ -341,6 +376,7 @@ private fun Application.configureServer(
             toolCallIds = incomingCallIds,
             model = model,
             toolProviders = toolProviders,
+            systemInstruction = systemInstruction,
           )
 
           val contentsToSend: Contents
@@ -387,14 +423,11 @@ private fun Application.configureServer(
 
             override fun onError(throwable: Throwable) {
               Log.e(TAG, "Tool session inference error (session=${session.id})", throwable)
+              logError = "LiteRT inference error: ${throwable.message ?: throwable.javaClass.simpleName}"
               tokenChannel.trySend(null)
             }
           }
-          if (isToolResultTurn) {
-            session.conversation.sendMessageAsync(Message.tool(contentsToSend), inferenceCallback, emptyMap())
-          } else {
-            session.conversation.sendMessageAsync(contentsToSend, inferenceCallback, emptyMap())
-          }
+          session.conversation.sendMessageAsync(contentsToSend, inferenceCallback, emptyMap())
 
           var inferenceReleased = false
           try {
@@ -440,6 +473,7 @@ private fun Application.configureServer(
 
             if (request.stream == true) {
               // ===== Streaming (SSE) response =====
+              logStatusCode = 200
               val includeUsage =
                 (request.stream_options?.get("include_usage") as? Boolean) == true
               call.respondBytesWriter(
@@ -615,6 +649,12 @@ private fun Application.configureServer(
               }
             } else {
               // ===== Non-streaming (plain JSON) — unchanged behaviour =====
+              logStatusCode = 200
+              logResponseSummary = ResponseSummary(
+                content = (assistantMessage.content ?: "").take(500),
+                finishReason = finishReason,
+                toolCallCount = toolCallsList?.size ?: 0,
+              )
               val response =
                 ChatCompletionResponse(
                   id = requestId,
@@ -635,6 +675,8 @@ private fun Application.configureServer(
           }
         }
       } catch (e: Exception) {
+        logStatusCode = 500
+        logError = "Unhandled error: ${e.message ?: e.javaClass.simpleName}"
         modelRepository.releaseInference()
         Log.e(TAG, "Unhandled error in /v1/chat/completions", e)
         call.respondError(
@@ -642,6 +684,20 @@ private fun Application.configureServer(
           "Internal server error: ${e.message}",
           "server_error",
           gson,
+        )
+      }
+      } finally {
+        DebugLogRepository.add(
+          LogEntry(
+            timestamp = Instant.now().toString(),
+            method = "POST",
+            path = "/v1/chat/completions",
+            statusCode = logStatusCode,
+            durationMs = System.currentTimeMillis() - requestStartMs,
+            requestSummary = logRequestSummary,
+            responseSummary = logResponseSummary,
+            error = logError,
+          )
         )
       }
     }
@@ -667,6 +723,15 @@ private fun Application.configureServer(
         )
       }
     }
+
+    get("/debug/logs") {
+      if (!BuildConfig.DEBUG) {
+        call.respond(HttpStatusCode.NotFound)
+        return@get
+      }
+      val entries = DebugLogRepository.getAll()
+      call.respond(mapOf("count" to entries.size, "entries" to entries))
+    }
   }
 }
 
@@ -685,6 +750,7 @@ private class SessionManager {
     toolCallIds: List<String> = emptyList(),
     model: com.google.ai.edge.gallery.data.Model,
     toolProviders: List<ToolProvider>,
+    systemInstruction: String? = null,
   ): ServerSession {
     evictExpired(model)
 
@@ -717,6 +783,7 @@ private class SessionManager {
       ConversationConfig(
         tools = toolProviders,
         automaticToolCalling = false,
+        systemInstruction = systemInstruction?.let { Contents.of(it) },
       )
     )
     // Keep instance.conversation pointing at the active conversation.
