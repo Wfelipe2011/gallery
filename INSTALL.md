@@ -3,6 +3,7 @@
 ## Build e instalar via Gradle (Windows)
 
 ```bash
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr" ;
 cd Android\src\ && .\gradlew.bat installDebug
 ```
 

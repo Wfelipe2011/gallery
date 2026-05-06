@@ -427,7 +427,8 @@ private fun Application.configureServer(
               tokenChannel.trySend(null)
             }
           }
-          session.conversation.sendMessageAsync(contentsToSend, inferenceCallback, emptyMap())
+          val messageToSend = if (isToolResultTurn) Message.tool(contentsToSend) else Message.user(contentsToSend)
+          session.conversation.sendMessageAsync(messageToSend, inferenceCallback, emptyMap())
 
           var inferenceReleased = false
           try {
