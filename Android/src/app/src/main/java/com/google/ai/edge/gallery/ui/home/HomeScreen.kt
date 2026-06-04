@@ -146,8 +146,9 @@ import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import com.google.ai.edge.gallery.data.Model
-import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatus
-import com.google.ai.edge.gallery.ui.modelmanager.ModelInitializationStatusType
+import com.google.ai.edge.gallery.server.ApiServerRuntimeState
+import com.google.ai.edge.gallery.server.ApiServerRuntimeStatus
+import com.google.ai.edge.gallery.server.RequiredRuntimeProfile
 
 private const val TAG = "AGHomeScreen"
 private const val TASK_COUNT_ANIMATION_DURATION = 250
@@ -468,15 +469,8 @@ fun HomeScreen(
                     enableAnimation = enableAnimation,
                     gm4 = gm4,
                     downloadedModels = downloadedLlmModels,
-                    modelInitializationStatus = uiState.modelInitializationStatus,
                     selectedApiModel = selectedApiModel,
-                    onModelSelected = { model ->
-                      val task = modelManagerViewModel.getTaskById(BuiltInTaskId.LLM_CHAT)
-                      if (task != null) {
-                        modelManagerViewModel.initializeModel(context, task, model)
-                      }
-                      apiServerViewModel.selectModel(model)
-                    }
+                    onModelSelected = { model -> apiServerViewModel.selectModel(model) }
                   )
                 }
 
@@ -1211,12 +1205,12 @@ fun ApiServerControlCard(
   enableAnimation: Boolean,
   gm4: Boolean,
   downloadedModels: List<Model>,
-  modelInitializationStatus: Map<String, ModelInitializationStatus>,
   selectedApiModel: Model?,
   onModelSelected: (Model) -> Unit,
 ) {
   val isServerRunning by apiServerViewModel.isServerRunning.collectAsState()
   val connectionUrl by apiServerViewModel.connectionUrl.collectAsState()
+  val apiRuntimeState by apiServerViewModel.runtimeState.collectAsState()
   val clipboardManager: ClipboardManager = LocalClipboardManager.current
 
   val progress = if (!enableAnimation) 1f else rememberDelayedAnimationProgress(
@@ -1226,19 +1220,20 @@ fun ApiServerControlCard(
   )
 
   var dropdownExpanded by remember { mutableStateOf(false) }
+  val sortedDownloadedModels = remember(downloadedModels) {
+    downloadedModels.sortedBy { apiServerModelDisplayName(it).lowercase() }
+  }
 
   // Auto-select default model when server starts and no model is selected
-  LaunchedEffect(isServerRunning, downloadedModels) {
-    if (isServerRunning && downloadedModels.isNotEmpty() && selectedApiModel == null) {
-      val defaultModel = downloadedModels.firstOrNull {
+  LaunchedEffect(isServerRunning, sortedDownloadedModels, selectedApiModel) {
+    if (isServerRunning && sortedDownloadedModels.isNotEmpty() && selectedApiModel == null) {
+      val defaultModel = sortedDownloadedModels.firstOrNull {
         it.name.contains("Gemma-4-E2B", ignoreCase = true) ||
           it.displayName.contains("Gemma-4-E2B", ignoreCase = true)
-      } ?: downloadedModels.first()
+      } ?: sortedDownloadedModels.first()
       onModelSelected(defaultModel)
     }
   }
-
-  val initStatus = modelInitializationStatus[selectedApiModel?.name]?.status
 
   Card(
     modifier = Modifier
@@ -1295,8 +1290,8 @@ fun ApiServerControlCard(
               modifier = Modifier.fillMaxWidth()
             ) {
               val displayName = selectedApiModel
-                ?.let { it.displayName.ifEmpty { it.name } }
-                ?: downloadedModels.first().let { it.displayName.ifEmpty { it.name } }
+                ?.let { apiServerModelDisplayName(it) }
+                ?: sortedDownloadedModels.first().let { apiServerModelDisplayName(it) }
               OutlinedTextField(
                 value = displayName,
                 onValueChange = {},
@@ -1311,9 +1306,9 @@ fun ApiServerControlCard(
                 expanded = dropdownExpanded,
                 onDismissRequest = { dropdownExpanded = false }
               ) {
-                downloadedModels.forEach { model ->
+                sortedDownloadedModels.forEach { model ->
                   DropdownMenuItem(
-                    text = { Text(model.displayName.ifEmpty { model.name }) },
+                    text = { Text(apiServerModelDisplayName(model)) },
                     onClick = {
                       onModelSelected(model)
                       dropdownExpanded = false
@@ -1324,39 +1319,18 @@ fun ApiServerControlCard(
               }
             }
 
-            // Model initialization status indicator
             Spacer(modifier = Modifier.height(8.dp))
-            when (initStatus) {
-              ModelInitializationStatusType.INITIALIZING -> {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                  Spacer(modifier = Modifier.width(8.dp))
-                  Text("Loading model…", style = MaterialTheme.typography.bodySmall)
-                }
-              }
-              ModelInitializationStatusType.INITIALIZED -> {
-                Text(
-                  "● Ready",
-                  style = MaterialTheme.typography.bodySmall,
-                  color = Color(0xFF4CAF50)
-                )
-              }
-              ModelInitializationStatusType.ERROR -> {
-                Text(
-                  "● Error loading model",
-                  style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.error
-                )
-              }
-              else -> {}
-            }
+            ApiServerRuntimeStatusRow(
+              apiRuntimeState = apiRuntimeState,
+              selectedApiModel = selectedApiModel,
+            )
           }
         }
       }
 
-      // URL row — only shown once model is ready
+      // URL row is available once a downloaded API model is selected.
       if (isServerRunning &&
-        initStatus == ModelInitializationStatusType.INITIALIZED &&
+        selectedApiModel != null &&
         connectionUrl.isNotEmpty()
       ) {
         Spacer(modifier = Modifier.height(12.dp))
@@ -1390,4 +1364,65 @@ fun ApiServerControlCard(
     }
   }
 }
+
+@Composable
+private fun ApiServerRuntimeStatusRow(
+  apiRuntimeState: ApiServerRuntimeState,
+  selectedApiModel: Model?,
+) {
+  if (selectedApiModel == null) return
+
+  when (apiRuntimeState.status) {
+    ApiServerRuntimeStatus.LOADING -> {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+          "Loading ${runtimeProfileLabel(apiRuntimeState.loadingRuntimeProfile)} runtime...",
+          style = MaterialTheme.typography.bodySmall,
+        )
+      }
+    }
+    ApiServerRuntimeStatus.READY -> {
+      Text(
+        "Ready (${runtimeProfileLabel(apiRuntimeState.loadedRuntimeProfile)} runtime)",
+        style = MaterialTheme.typography.bodySmall,
+        color = Color(0xFF4CAF50),
+      )
+    }
+    ApiServerRuntimeStatus.UNLOADED_AFTER_IDLE -> {
+      Text(
+        "Runtime unloaded after idle. Will load on next request.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+    }
+    ApiServerRuntimeStatus.ERROR -> {
+      Text(
+        apiRuntimeState.errorMessage?.let { "Error loading model: $it" } ?: "Error loading model",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+      )
+    }
+    ApiServerRuntimeStatus.READY_FOR_REQUEST,
+    ApiServerRuntimeStatus.NO_MODEL_SELECTED -> {
+      Text(
+        "Runtime will load on next request.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+    }
+  }
+}
+
+private fun apiServerModelDisplayName(model: Model): String = model.displayName.ifEmpty { model.name }
+
+private fun runtimeProfileLabel(profile: RequiredRuntimeProfile?): String =
+  when (profile) {
+    RequiredRuntimeProfile.TEXT -> "text"
+    RequiredRuntimeProfile.IMAGE -> "image"
+    RequiredRuntimeProfile.AUDIO -> "audio"
+    RequiredRuntimeProfile.IMAGE_AUDIO -> "image + audio"
+    null -> "selected"
+  }
 

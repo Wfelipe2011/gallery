@@ -6,6 +6,9 @@ data class RequestSummary(
     val messageCount: Int,
     val hasTools: Boolean,
     val hasSystemMessage: Boolean,
+    val imageCount: Int = 0,
+    val audioClipCount: Int = 0,
+    val requiredProfile: String? = null,
 )
 
 data class ResponseSummary(

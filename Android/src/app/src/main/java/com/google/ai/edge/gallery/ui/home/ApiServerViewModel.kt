@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.wifi.WifiManager
 import androidx.lifecycle.ViewModel
 import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.server.ApiServerRuntimeCoordinator
 import com.google.ai.edge.gallery.server.InferenceServerService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -14,7 +15,8 @@ import javax.inject.Inject
 
 @HiltViewModel
 class ApiServerViewModel @Inject constructor(
-    @ApplicationContext private val context: Context
+    @param:ApplicationContext private val context: Context,
+    private val apiServerRuntimeCoordinator: ApiServerRuntimeCoordinator,
 ) : ViewModel() {
 
     private val _isServerRunning = MutableStateFlow(false)
@@ -25,6 +27,8 @@ class ApiServerViewModel @Inject constructor(
 
     private val _selectedApiModel = MutableStateFlow<Model?>(null)
     val selectedApiModel = _selectedApiModel.asStateFlow()
+
+    val runtimeState = apiServerRuntimeCoordinator.runtimeState
 
     fun startServer() {
         val intent = Intent(context, InferenceServerService::class.java)
@@ -43,10 +47,12 @@ class ApiServerViewModel @Inject constructor(
 
     fun selectModel(model: Model) {
         _selectedApiModel.value = model
+        apiServerRuntimeCoordinator.selectModel(model)
     }
 
     fun clearSelectedModel() {
         _selectedApiModel.value = null
+        apiServerRuntimeCoordinator.clearSelectedModel()
     }
 
     @Suppress("DEPRECATION")

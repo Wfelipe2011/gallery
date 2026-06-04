@@ -56,10 +56,11 @@ private const val NOTIFICATION_ID = 1001
 class InferenceServerService : Service() {
 
   @Inject lateinit var modelRepository: ModelRepository
+  @Inject lateinit var apiServerRuntimeCoordinator: ApiServerRuntimeCoordinator
 
   private var ktorServer: EmbeddedServer<*, *>? = null
   private var wifiLock: WifiManager.WifiLock? = null
-  private val gson = Gson()
+  private val gson = createServerGson()
   private val sessionManager = SessionManager()
 
   override fun onBind(intent: Intent?): IBinder? = null
@@ -83,7 +84,9 @@ class InferenceServerService : Service() {
 
     if (ktorServer == null) {
       ktorServer =
-        embeddedServer(CIO, port = SERVER_PORT) { configureServer(modelRepository, gson, sessionManager) }
+        embeddedServer(CIO, port = SERVER_PORT) {
+          configureServer(modelRepository, apiServerRuntimeCoordinator, gson, sessionManager)
+        }
       ktorServer?.start(wait = false)
       Log.i(TAG, "Ktor server started on port $SERVER_PORT")
     }
@@ -93,6 +96,7 @@ class InferenceServerService : Service() {
 
   override fun onDestroy() {
     super.onDestroy()
+    apiServerRuntimeCoordinator.cancelPendingIdleUnload()
     sessionManager.closeAll()
     runBlocking { ktorServer?.stop(1_000, 5_000) }
     ktorServer = null
@@ -119,10 +123,11 @@ class InferenceServerService : Service() {
 
 private fun Application.configureServer(
   modelRepository: ModelRepository,
+  apiServerRuntimeCoordinator: ApiServerRuntimeCoordinator,
   gson: Gson,
   sessionManager: SessionManager,
 ) {
-  install(ContentNegotiation) { gson() }
+  install(ContentNegotiation) { gson { registerServerJsonAdapters() } }
 
   routing {
     post("/v1/chat/completions") {
@@ -131,6 +136,18 @@ private fun Application.configureServer(
       var logError: String? = null
       var logRequestSummary = RequestSummary(0, false, false)
       var logResponseSummary: ResponseSummary? = null
+      var inferenceLockHeld = false
+      var acceptedApiRequest = false
+      fun finishAcceptedApiRequest() {
+        if (inferenceLockHeld) {
+          modelRepository.releaseInference()
+          inferenceLockHeld = false
+        }
+        if (acceptedApiRequest) {
+          apiServerRuntimeCoordinator.scheduleIdleUnload { sessionManager.hasActiveSessions() }
+          acceptedApiRequest = false
+        }
+      }
       try {
       val request =
         try {
@@ -165,16 +182,46 @@ private fun Application.configureServer(
         return@post
       }
 
-      val model = modelRepository.getActiveModel()
-      if (model == null) {
-        logStatusCode = 503
-        logError = "No model is currently loaded."
+      if (request.requestsUnsupportedAudioOutput()) {
+        logStatusCode = 400
+        logError = "Audio output is not supported by this API server."
         call.respondError(
-          HttpStatusCode.ServiceUnavailable,
-          "No model is currently loaded.",
-          "server_error",
+          HttpStatusCode.BadRequest,
+          "Audio output is not supported by this API server.",
+          "invalid_request_error",
           gson,
-          code = 503,
+        )
+        return@post
+      }
+
+      val hasTools = !request.tools.isNullOrEmpty()
+      if (hasTools && request.messages.hasMediaContentParts()) {
+        logStatusCode = 400
+        logError = "Multimodal tool-calling requests are not supported."
+        call.respondError(
+          HttpStatusCode.BadRequest,
+          "Multimodal tool-calling requests are not supported by this API server.",
+          "invalid_request_error",
+          gson,
+        )
+        return@post
+      }
+
+      val parsedContent = ChatCompletionContentParser.parseMessages(request.messages)
+      logRequestSummary = logRequestSummary.copy(
+        imageCount = parsedContent.imageCount,
+        audioClipCount = parsedContent.audioClipCount,
+        requiredProfile = parsedContent.requiredProfile.name,
+      )
+      if (!parsedContent.isValid) {
+        val errorMessage = parsedContent.validationErrors.firstOrNull()?.message ?: "Invalid message content."
+        logStatusCode = 400
+        logError = errorMessage
+        call.respondError(
+          HttpStatusCode.BadRequest,
+          errorMessage,
+          "invalid_request_error",
+          gson,
         )
         return@post
       }
@@ -191,6 +238,70 @@ private fun Application.configureServer(
         )
         return@post
       }
+      inferenceLockHeld = true
+      acceptedApiRequest = true
+      apiServerRuntimeCoordinator.onRequestAccepted()
+
+      val selectedModel = apiServerRuntimeCoordinator.getSelectedModel()
+      if (
+        parsedContent.requiredProfile.supportImage &&
+          selectedModel != null &&
+          !selectedModel.llmSupportImage
+      ) {
+        logStatusCode = 400
+        logError = "Image input is not supported by the selected model."
+        try {
+          call.respondError(
+            HttpStatusCode.BadRequest,
+            "Image input is not supported by the selected model.",
+            "invalid_request_error",
+            gson,
+          )
+        } finally {
+          finishAcceptedApiRequest()
+        }
+        return@post
+      }
+      if (
+        parsedContent.requiredProfile.supportAudio &&
+          selectedModel != null &&
+          !selectedModel.llmSupportAudio
+      ) {
+        logStatusCode = 400
+        logError = "Audio input is not supported by the selected model."
+        try {
+          call.respondError(
+            HttpStatusCode.BadRequest,
+            "Audio input is not supported by the selected model.",
+            "invalid_request_error",
+            gson,
+          )
+        } finally {
+          finishAcceptedApiRequest()
+        }
+        return@post
+      }
+
+      val modelLoadResult = apiServerRuntimeCoordinator.ensureModelLoaded(parsedContent.requiredProfile)
+      if (modelLoadResult is ApiServerModelLoadResult.Failure) {
+        logStatusCode = 503
+        logError = modelLoadResult.message
+        try {
+          call.respondError(
+            HttpStatusCode.ServiceUnavailable,
+            modelLoadResult.message,
+            "server_error",
+            gson,
+            code = 503,
+          )
+        } finally {
+          finishAcceptedApiRequest()
+        }
+        return@post
+      }
+      val loadedRuntime = modelLoadResult as ApiServerModelLoadResult.Success
+      val model = loadedRuntime.model
+      val runtimeProfile = loadedRuntime.profile
 
       try {
         val requestId = "chatcmpl-${UUID.randomUUID()}"
@@ -206,8 +317,8 @@ private fun Application.configureServer(
           // Reset conversation before each stateless request.
           LlmChatModelHelper.resetConversation(
             model = model,
-            supportImage = false,
-            supportAudio = false,
+            supportImage = runtimeProfile.supportImage,
+            supportAudio = runtimeProfile.supportAudio,
             systemInstruction = formatted.systemInstruction?.let { Contents.of(it) },
           )
 
@@ -232,9 +343,12 @@ private fun Application.configureServer(
               Log.e(TAG, "Inference error: $errorMsg")
               channel.trySend(null)
             },
+            images = parsedContent.imageBitmaps,
+            audioClips = parsedContent.audioBytes,
           )
 
           if (isStreaming) {
+            val streamingResponseSummary = StringBuilder()
             logStatusCode = 200
             call.respondBytesWriter(
               contentType = ContentType.parse("text/event-stream"),
@@ -258,6 +372,7 @@ private fun Application.configureServer(
                 // 2. Content chunks
                 for (token in channel) {
                   if (token == null) break
+                  streamingResponseSummary.append(token)
                   writeChunk(
                     this,
                     gson,
@@ -283,10 +398,15 @@ private fun Application.configureServer(
                 )
 
                 // 4. [DONE]
+                logResponseSummary = ResponseSummary(
+                  content = streamingResponseSummary.toString().take(500),
+                  finishReason = "stop",
+                  toolCallCount = 0,
+                )
                 writeStringUtf8("data: [DONE]\n\n")
                 flush()
               } finally {
-                modelRepository.releaseInference()
+                finishAcceptedApiRequest()
               }
             }
           } else {
@@ -319,7 +439,7 @@ private fun Application.configureServer(
                 )
               call.respond(response)
             } finally {
-              modelRepository.releaseInference()
+                finishAcceptedApiRequest()
             }
           }
         } else {
@@ -335,14 +455,17 @@ private fun Application.configureServer(
             }
             logStatusCode = 503
             logError = "Model instance not initialized."
-            modelRepository.releaseInference()
-            call.respondError(
-              HttpStatusCode.ServiceUnavailable,
-              "Model instance not initialized.",
-              "server_error",
-              gson,
-              code = 503,
-            )
+            try {
+              call.respondError(
+                HttpStatusCode.ServiceUnavailable,
+                "Model instance not initialized.",
+                "server_error",
+                gson,
+                code = 503,
+              )
+            } finally {
+              finishAcceptedApiRequest()
+            }
             return@post
           }
 
@@ -352,7 +475,7 @@ private fun Application.configureServer(
 
           // Extract system instruction before filtering — it will be applied when a new
           // session is created. Existing sessions already have the instruction applied.
-          val systemInstruction = request.messages.firstOrNull { it.role == "system" }?.content
+          val systemInstruction = request.messages.firstOrNull { it.role == "system" }?.textContent
 
           // Determine turn type BEFORE session lookup so we can recover the correct
           // session via tool_call_id when clients don't echo X-Session-Id.
@@ -396,11 +519,11 @@ private fun Application.configureServer(
             val toolMessages = nonSystemMessages.filter { it.role == "tool" }
             val toolResponses: List<Content> = toolMessages.map { msg ->
               val name = idToName[msg.tool_call_id] ?: (msg.tool_call_id ?: "unknown")
-              Content.ToolResponse(name = name, response = msg.content ?: "")
+              Content.ToolResponse(name = name, response = msg.textContent ?: "")
             }
             contentsToSend = Contents.of(toolResponses)
           } else {
-            val userText = nonSystemMessages.lastOrNull { it.role == "user" }?.content ?: ""
+            val userText = nonSystemMessages.lastOrNull { it.role == "user" }?.textContent ?: ""
             contentsToSend = Contents.of(listOf(Content.Text(userText)))
           }
 
@@ -475,6 +598,11 @@ private fun Application.configureServer(
             if (request.stream == true) {
               // ===== Streaming (SSE) response =====
               logStatusCode = 200
+              logResponseSummary = ResponseSummary(
+                content = (assistantMessage.content ?: "").take(500),
+                finishReason = finishReason,
+                toolCallCount = toolCallsList?.size ?: 0,
+              )
               val includeUsage =
                 (request.stream_options?.get("include_usage") as? Boolean) == true
               call.respondBytesWriter(
@@ -640,13 +768,12 @@ private fun Application.configureServer(
                   writeStringUtf8("data: [DONE]\n\n")
                   flush()
                 } finally {
-                  modelRepository.releaseInference()
+                  if (finishReason == "stop") {
+                    sessionManager.closeSession(session)
+                  }
+                  finishAcceptedApiRequest()
                   inferenceReleased = true
                 }
-              }
-              // Session cleanup after streaming body completes.
-              if (finishReason == "stop") {
-                sessionManager.closeSession(session)
               }
             } else {
               // ===== Non-streaming (plain JSON) — unchanged behaviour =====
@@ -672,13 +799,13 @@ private fun Application.configureServer(
               }
             }
           } finally {
-            if (!inferenceReleased) modelRepository.releaseInference()
+            if (!inferenceReleased) finishAcceptedApiRequest()
           }
         }
       } catch (e: Exception) {
         logStatusCode = 500
         logError = "Unhandled error: ${e.message ?: e.javaClass.simpleName}"
-        modelRepository.releaseInference()
+        finishAcceptedApiRequest()
         Log.e(TAG, "Unhandled error in /v1/chat/completions", e)
         call.respondError(
           HttpStatusCode.InternalServerError,
@@ -851,6 +978,19 @@ private class SessionManager {
     sessions.remove(sessionId)
   }
 
+  fun hasActiveSessions(): Boolean {
+    val iter = sessions.entries.iterator()
+    while (iter.hasNext()) {
+      val entry = iter.next()
+      if (entry.value.isExpired()) {
+        entry.value.closeConversation()
+        iter.remove()
+        callIdToSessionId.entries.removeIf { it.value == entry.key }
+      }
+    }
+    return sessions.isNotEmpty()
+  }
+
   fun closeAll() {
     sessions.values.forEach { session ->
       try {
@@ -879,6 +1019,17 @@ private suspend fun writeChunk(channel: ByteWriteChannel, gson: Gson, chunk: Cha
   channel.writeStringUtf8("data: ${gson.toJson(chunk)}\n\n")
   channel.flush()
 }
+
+private fun ChatCompletionRequest.requestsUnsupportedAudioOutput(): Boolean =
+  audio != null || modalities.orEmpty().any { it.equals("audio", ignoreCase = true) }
+
+private fun List<ChatMessage>.hasMediaContentParts(): Boolean =
+  any { message ->
+    val content = message.content as? ChatMessageContent.Parts ?: return@any false
+    content.parts.any { part ->
+      part is ChatCompletionContentPart.ImageUrl || part is ChatCompletionContentPart.InputAudio
+    }
+  }
 
 // ---------------------------------------------------------------------------
 // Error response helper

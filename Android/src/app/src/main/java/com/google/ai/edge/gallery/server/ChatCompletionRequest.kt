@@ -8,4 +8,6 @@ data class ChatCompletionRequest(
   val temperature: Float? = null,
   val max_tokens: Int? = null,
   val tools: List<Map<String, Any>>? = null,
+  val modalities: List<String>? = null,
+  val audio: Any? = null,
 )
