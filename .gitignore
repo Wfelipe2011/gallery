@@ -2,3 +2,5 @@
 openspec
 .agent
 .github
+.codex
+*.key
