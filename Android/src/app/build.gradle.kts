@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+import java.io.InputStream
+import java.util.zip.ZipFile
+
 plugins {
   alias(libs.plugins.android.application)
   // Note: set apply to true to enable google-services (requires google-services.json).
@@ -26,6 +29,78 @@ plugins {
   alias(libs.plugins.oss.licenses)
   alias(libs.plugins.ksp)
 }
+
+fun String.asBuildConfigStringLiteral(): String =
+  "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+val ngrokKeyFile = rootProject.layout.projectDirectory.file("../../ngrok.key")
+val ngrokAuthtokenProvider =
+  if (ngrokKeyFile.asFile.isFile) {
+    providers.fileContents(ngrokKeyFile).asText.map { it.trim() }
+  } else {
+    providers.provider { "" }
+  }
+
+val ngrokNativeArtifact = configurations.create("ngrokNativeArtifact") {
+  isCanBeConsumed = false
+  isCanBeResolved = true
+}
+val ngrokNativeJniLibsDir = layout.buildDirectory.dir("generated/ngrokNativeJniLibs")
+val ngrokNativeArtifactFiles = ngrokNativeArtifact.incoming.artifactView {}.files
+val extractNgrokNativeJniLibs =
+  tasks.register("extractNgrokNativeJniLibs") {
+    val libraryFile = ngrokNativeJniLibsDir.map { it.file("arm64-v8a/libngrok_java.so") }
+    inputs.files(ngrokNativeArtifactFiles)
+    outputs.file(libraryFile)
+    outputs.upToDateWhen { false }
+
+    doLast {
+      val artifact =
+        ngrokNativeArtifactFiles.files.singleOrNull { file ->
+          file.name.startsWith("ngrok-java-native") && file.extension == "jar"
+        } ?: throw GradleException("Unable to find ngrok-java-native artifact.")
+
+      val bytes =
+        ZipFile(artifact).use { zipFile: ZipFile ->
+          val entry =
+            zipFile.getEntry("libngrok_java.so")
+              ?: throw GradleException("ngrok native artifact does not contain libngrok_java.so.")
+          zipFile.getInputStream(entry).use { input: InputStream -> input.readBytes() }
+        }
+
+      val jniVersion18 =
+        byteArrayOf(0x00, 0x01, 0x80.toByte(), 0x52, 0x20, 0x00, 0xa0.toByte(), 0x72)
+      val jniVersion16 =
+        byteArrayOf(0xc0.toByte(), 0x00, 0x80.toByte(), 0x52, 0x20, 0x00, 0xa0.toByte(), 0x72)
+
+      fun ByteArray.sliceIndexes(slice: ByteArray): List<Int> {
+        val indexes = mutableListOf<Int>()
+        for (index in 0..size - slice.size) {
+          var matches = true
+          for (sliceIndex in slice.indices) {
+            if (this[index + sliceIndex] != slice[sliceIndex]) {
+              matches = false
+              break
+            }
+          }
+          if (matches) indexes += index
+        }
+        return indexes
+      }
+
+      val patchIndexes = bytes.sliceIndexes(jniVersion18)
+      if (patchIndexes.size != 1) {
+        throw GradleException(
+          "Expected one ngrok JNI_VERSION_1_8 return sequence, found ${patchIndexes.size}.",
+        )
+      }
+
+      jniVersion16.copyInto(bytes, patchIndexes.single())
+      val outputFile = libraryFile.get().asFile
+      outputFile.parentFile.mkdirs()
+      outputFile.writeBytes(bytes)
+    }
+  }
 
 android {
   namespace = "com.google.ai.edge.gallery"
@@ -46,6 +121,12 @@ android {
     manifestPlaceholders["appIcon"] = "@mipmap/ic_launcher"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    buildConfigField(
+      "String",
+      "NGROK_AUTHTOKEN",
+      ngrokAuthtokenProvider.get().asBuildConfigStringLiteral(),
+    )
   }
 
   buildTypes {
@@ -67,6 +148,15 @@ android {
     compose = true
     buildConfig = true
   }
+  sourceSets {
+    getByName("main") {
+      jniLibs.srcDir(ngrokNativeJniLibsDir)
+    }
+  }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+  dependsOn(extractNgrokNativeJniLibs)
 }
 
 dependencies {
@@ -125,6 +215,10 @@ dependencies {
   implementation(libs.ktor.server.sse)
   implementation(libs.ktor.server.content.negotiation)
   implementation(libs.ktor.serialization.gson)
+  implementation(libs.ngrok.java)
+  implementation(variantOf(libs.ngrok.java.native) { classifier("linux-android-aarch_64") })
+  ngrokNativeArtifact(variantOf(libs.ngrok.java.native) { classifier("linux-android-aarch_64") })
+  implementation(libs.slf4j.api)
 }
 
 protobuf {

@@ -5,8 +5,10 @@ import android.content.Intent
 import android.net.wifi.WifiManager
 import androidx.lifecycle.ViewModel
 import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.server.ApiAccessCodeCoordinator
 import com.google.ai.edge.gallery.server.ApiServerRuntimeCoordinator
 import com.google.ai.edge.gallery.server.InferenceServerService
+import com.google.ai.edge.gallery.server.NgrokTunnelCoordinator
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,6 +19,8 @@ import javax.inject.Inject
 class ApiServerViewModel @Inject constructor(
     @param:ApplicationContext private val context: Context,
     private val apiServerRuntimeCoordinator: ApiServerRuntimeCoordinator,
+    private val ngrokTunnelCoordinator: NgrokTunnelCoordinator,
+    private val apiAccessCodeCoordinator: ApiAccessCodeCoordinator,
 ) : ViewModel() {
 
     private val _isServerRunning = MutableStateFlow(false)
@@ -29,6 +33,12 @@ class ApiServerViewModel @Inject constructor(
     val selectedApiModel = _selectedApiModel.asStateFlow()
 
     val runtimeState = apiServerRuntimeCoordinator.runtimeState
+    val tunnelState = ngrokTunnelCoordinator.tunnelState
+    val accessCode = apiAccessCodeCoordinator.accessCode
+
+    init {
+        apiAccessCodeCoordinator.currentCode()
+    }
 
     fun startServer() {
         val intent = Intent(context, InferenceServerService::class.java)
@@ -53,6 +63,10 @@ class ApiServerViewModel @Inject constructor(
     fun clearSelectedModel() {
         _selectedApiModel.value = null
         apiServerRuntimeCoordinator.clearSelectedModel()
+    }
+
+    fun regenerateAccessCode() {
+        apiAccessCodeCoordinator.regenerateCode()
     }
 
     @Suppress("DEPRECATION")

@@ -57,6 +57,8 @@ class InferenceServerService : Service() {
 
   @Inject lateinit var modelRepository: ModelRepository
   @Inject lateinit var apiServerRuntimeCoordinator: ApiServerRuntimeCoordinator
+  @Inject lateinit var apiAccessCodeCoordinator: ApiAccessCodeCoordinator
+  @Inject lateinit var ngrokTunnelCoordinator: NgrokTunnelCoordinator
 
   private var ktorServer: EmbeddedServer<*, *>? = null
   private var wifiLock: WifiManager.WifiLock? = null
@@ -85,11 +87,18 @@ class InferenceServerService : Service() {
     if (ktorServer == null) {
       ktorServer =
         embeddedServer(CIO, port = SERVER_PORT) {
-          configureServer(modelRepository, apiServerRuntimeCoordinator, gson, sessionManager)
+          configureServer(
+            modelRepository,
+            apiServerRuntimeCoordinator,
+            apiAccessCodeCoordinator,
+            gson,
+            sessionManager,
+          )
         }
       ktorServer?.start(wait = false)
       Log.i(TAG, "Ktor server started on port $SERVER_PORT")
     }
+    ngrokTunnelCoordinator.startTunnel()
 
     return START_STICKY
   }
@@ -97,6 +106,7 @@ class InferenceServerService : Service() {
   override fun onDestroy() {
     super.onDestroy()
     apiServerRuntimeCoordinator.cancelPendingIdleUnload()
+    ngrokTunnelCoordinator.stopTunnel()
     sessionManager.closeAll()
     runBlocking { ktorServer?.stop(1_000, 5_000) }
     ktorServer = null
@@ -124,6 +134,7 @@ class InferenceServerService : Service() {
 private fun Application.configureServer(
   modelRepository: ModelRepository,
   apiServerRuntimeCoordinator: ApiServerRuntimeCoordinator,
+  apiAccessCodeCoordinator: ApiAccessCodeCoordinator,
   gson: Gson,
   sessionManager: SessionManager,
 ) {
@@ -131,6 +142,8 @@ private fun Application.configureServer(
 
   routing {
     post("/v1/chat/completions") {
+      if (!call.requireApiAccessCode(apiAccessCodeCoordinator, gson)) return@post
+
       val requestStartMs = System.currentTimeMillis()
       var logStatusCode = 500
       var logError: String? = null
@@ -831,6 +844,8 @@ private fun Application.configureServer(
     }
 
     get("/v1/models") {
+      if (!call.requireApiAccessCode(apiAccessCodeCoordinator, gson)) return@get
+
       val models = modelRepository.getDownloadedModels().map { model ->
         ModelObject(id = model.name, created = System.currentTimeMillis() / 1000L)
       }
@@ -838,6 +853,8 @@ private fun Application.configureServer(
     }
 
     get("/v1/models/{modelId}") {
+      if (!call.requireApiAccessCode(apiAccessCodeCoordinator, gson)) return@get
+
       val modelId = call.parameters["modelId"] ?: ""
       val model = modelRepository.getDownloadedModels().find { it.name == modelId }
       if (model != null) {
@@ -857,6 +874,8 @@ private fun Application.configureServer(
         call.respond(HttpStatusCode.NotFound)
         return@get
       }
+      if (!call.requireApiAccessCode(apiAccessCodeCoordinator, gson)) return@get
+
       val entries = DebugLogRepository.getAll()
       call.respond(mapOf("count" to entries.size, "entries" to entries))
     }

@@ -142,12 +142,15 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.server.ApiServerRuntimeState
 import com.google.ai.edge.gallery.server.ApiServerRuntimeStatus
+import com.google.ai.edge.gallery.server.NgrokTunnelState
+import com.google.ai.edge.gallery.server.NgrokTunnelStatus
 import com.google.ai.edge.gallery.server.RequiredRuntimeProfile
 
 private const val TAG = "AGHomeScreen"
@@ -1211,6 +1214,8 @@ fun ApiServerControlCard(
   val isServerRunning by apiServerViewModel.isServerRunning.collectAsState()
   val connectionUrl by apiServerViewModel.connectionUrl.collectAsState()
   val apiRuntimeState by apiServerViewModel.runtimeState.collectAsState()
+  val tunnelState by apiServerViewModel.tunnelState.collectAsState()
+  val accessCode by apiServerViewModel.accessCode.collectAsState()
   val clipboardManager: ClipboardManager = LocalClipboardManager.current
 
   val progress = if (!enableAnimation) 1f else rememberDelayedAnimationProgress(
@@ -1334,32 +1339,169 @@ fun ApiServerControlCard(
         connectionUrl.isNotEmpty()
       ) {
         Spacer(modifier = Modifier.height(12.dp))
-        Row(
-          modifier = Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-          horizontalArrangement = Arrangement.SpaceBetween,
-          verticalAlignment = Alignment.CenterVertically
+        Column(
+          verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-          Text(
-            text = connectionUrl,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.weight(1f)
+          ApiServerValueRow(
+            label = "Local URL",
+            value = connectionUrl,
+            onCopy = { clipboardManager.setText(AnnotatedString(connectionUrl)) },
           )
-          IconButton(
-            onClick = { clipboardManager.setText(AnnotatedString(connectionUrl)) },
-            modifier = Modifier.size(24.dp)
-          ) {
-            Icon(
-              imageVector = Icons.Rounded.ContentCopy,
-              contentDescription = "Copy Link",
-              tint = MaterialTheme.colorScheme.primary,
-              modifier = Modifier.size(16.dp)
+
+          val publicUrl = tunnelState.publicUrl
+          if (tunnelState.status == NgrokTunnelStatus.RUNNING && !publicUrl.isNullOrBlank()) {
+            ApiServerValueRow(
+              label = "Public URL",
+              value = publicUrl,
+              onCopy = { clipboardManager.setText(AnnotatedString(publicUrl)) },
+            )
+          } else {
+            ApiServerTunnelStatusRow(tunnelState = tunnelState)
+          }
+
+          accessCode?.let { code ->
+            ApiServerAccessCodeRow(
+              accessCode = code,
+              onCopy = { clipboardManager.setText(AnnotatedString(code)) },
+              onRegenerate = apiServerViewModel::regenerateAccessCode,
             )
           }
         }
+      }
+    }
+  }
+}
+
+@Composable
+private fun ApiServerValueRow(
+  label: String,
+  value: String,
+  onCopy: () -> Unit,
+) {
+  Row(
+    modifier = Modifier
+      .fillMaxWidth()
+      .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+      .padding(horizontal = 12.dp, vertical = 8.dp),
+    horizontalArrangement = Arrangement.SpaceBetween,
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Column(modifier = Modifier.weight(1f)) {
+      Text(
+        text = label,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      Text(
+        text = value,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurface,
+      )
+    }
+    IconButton(
+      onClick = onCopy,
+      modifier = Modifier.size(32.dp),
+    ) {
+      Icon(
+        imageVector = Icons.Rounded.ContentCopy,
+        contentDescription = "Copy $label",
+        tint = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.size(16.dp),
+      )
+    }
+  }
+}
+
+@Composable
+private fun ApiServerTunnelStatusRow(tunnelState: NgrokTunnelState) {
+  when (tunnelState.status) {
+    NgrokTunnelStatus.STARTING -> {
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+          .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+          text = "Public tunnel connecting...",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
+    }
+    NgrokTunnelStatus.ERROR -> {
+      Text(
+        text = tunnelState.errorMessage ?: "Public tunnel unavailable.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier
+          .fillMaxWidth()
+          .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+          .padding(horizontal = 12.dp, vertical = 8.dp),
+      )
+    }
+    NgrokTunnelStatus.STOPPED,
+    NgrokTunnelStatus.RUNNING -> Unit
+  }
+}
+
+@Composable
+private fun ApiServerAccessCodeRow(
+  accessCode: String,
+  onCopy: () -> Unit,
+  onRegenerate: () -> Unit,
+) {
+  Row(
+    modifier = Modifier
+      .fillMaxWidth()
+      .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+      .padding(horizontal = 12.dp, vertical = 8.dp),
+    horizontalArrangement = Arrangement.SpaceBetween,
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Column(modifier = Modifier.weight(1f)) {
+      Text(
+        text = "OpenAI-compatible bearer API key",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      Text(
+        text = accessCode,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        fontWeight = FontWeight.Bold,
+      )
+      Text(
+        text = "Send as Authorization: Bearer $accessCode",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+    }
+    Row {
+      IconButton(
+        onClick = onCopy,
+        modifier = Modifier.size(32.dp),
+      ) {
+        Icon(
+          imageVector = Icons.Rounded.ContentCopy,
+          contentDescription = "Copy API key",
+          tint = MaterialTheme.colorScheme.primary,
+          modifier = Modifier.size(16.dp),
+        )
+      }
+      IconButton(
+        onClick = onRegenerate,
+        modifier = Modifier.size(32.dp),
+      ) {
+        Icon(
+          imageVector = Icons.Rounded.Refresh,
+          contentDescription = "Regenerate API key",
+          tint = MaterialTheme.colorScheme.primary,
+          modifier = Modifier.size(16.dp),
+        )
       }
     }
   }
